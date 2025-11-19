@@ -1,8 +1,12 @@
 #include <iostream>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <unistd.h>
 #include <netdb.h>
 #include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/time.h>
 
 int main(const int argc, char* argv[] ) {
     //Must be only one argument provided
@@ -119,8 +123,20 @@ int main(const int argc, char* argv[] ) {
     //Create pointers which will be used to point to objects of types sockaddr_in and sockaddr_in6
     struct sockaddr_in *sockaddr_ipv4;
     struct sockaddr_in6 *sockaddr_ipv6;
-    size_t ipbufferlength;
-    char *ipbuffer = nullptr;
+    //Create ipbuffer with max possible size = ipv6
+    char ipbuffer[INET6_ADDRSTRLEN];
+    std::string ipv = "";
+    int sockfd, connfd, selectfd;
+    bool connected = false;
+    int errno;
+
+    fd_set writefds; // Used to perform select() in the socket
+    struct timeval tv;
+    tv.tv_sec = 5;
+    tv.tv_usec = 5000;
+
+    int optval;
+    socklen_t optlen;
 
     std::cout << "Resolved addresses for " << hostname << ":"<<std::endl;
 
@@ -130,37 +146,61 @@ int main(const int argc, char* argv[] ) {
         if (rp->ai_family == AF_INET) {
             v4_addr_count++;
             sockaddr_ipv4 = (struct sockaddr_in *)rp->ai_addr;
-            ipbufferlength = INET_ADDRSTRLEN; //ipv4 buffer should hold 16 chars
-
-            ipbuffer = new char[ipbufferlength];
-
-            auto results = inet_ntop(AF_INET, &sockaddr_ipv4->sin_addr, ipbuffer, ipbufferlength);
-
+            //Use inet_ntop to transform IP address from HEX to ipv4
+            auto results = inet_ntop(AF_INET, &sockaddr_ipv4->sin_addr, ipbuffer, INET_ADDRSTRLEN);
             if (results == nullptr) {
                 std::cout << "IPv4: <invalid>" << std::endl;
             } else {
                 std::cout <<"IPv4: "<< ipbuffer << std::endl;
             }
-
+            ipv = "IPv4";
         } else if (rp->ai_family == AF_INET6) { // AF_INET6 is for ipv6
             v6_addr_count++;
             sockaddr_ipv6 = (struct sockaddr_in6 *)rp->ai_addr;
-            ipbufferlength = INET6_ADDRSTRLEN; //ipv6 buffer should hold 46 chars
-
-            ipbuffer = new char[ipbufferlength];
-
-            auto results = inet_ntop(AF_INET6, &sockaddr_ipv6->sin6_addr,ipbuffer, ipbufferlength);
+            //Use inet_ntop to transform IP address from HEX to ipv6
+            auto results = inet_ntop(AF_INET6, &sockaddr_ipv6->sin6_addr,ipbuffer, INET6_ADDRSTRLEN);
             if (results == nullptr) {
                 std::cout << "IPv6: <invalid>" << std::endl;
             } else {
                 std::cout <<"IPv6: "<< ipbuffer << std::endl;
             }
+            ipv = "IPv6";
         }
         total_addr_count++;
-        delete[] ipbuffer;
+        //If socket creation is not successful proceed with next rp
+        if ((sockfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol)) == -1) {
+            continue;
+        }
+        fcntl(sockfd, F_SETFL, O_NONBLOCK); //Set the successful socket to non-blocking
+
+        if((connfd = connect(sockfd, rp->ai_addr, rp->ai_addrlen)) == 0) {
+            connected = true;
+            std::cout << "Connected to straight"<< ipbuffer <<":80 " << ipv << std::endl;
+            break;
+        } else if(connfd == -1 && errno == EINPROGRESS) { // If unable to connect straight away, wait a bit to get result again
+            FD_ZERO(&writefds);//initialize file descriptor set values to contain no file descriptors
+            FD_SET(sockfd, &writefds); //set the current used socket to t
+            selectfd = select(sockfd+1,NULL,&writefds,NULL,&tv); //get the answer from socket in timespan selected in tv timeval struct
+            if (selectfd > 0) { // If we have at least one answer from the socket then proceed
+                if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &optval, &optlen)== 0) { // if connection succeeded stop looking
+                    connected = true;
+                    std::cout << "Connected to "<< ipbuffer <<":80 " << ipv << std::endl;
+                    FD_CLR(sockfd, &writefds); //remove socket from file descriptor set
+                    fcntl(sockfd, F_SETFL, ~O_NONBLOCK);
+                    break;
+                }
+                std::cout << "errno getsockopt: " << errno << std::endl;
+            }
+            FD_CLR(sockfd, &writefds); //remove socket from file descriptor set
+        }
+        close(sockfd); // Close socket if connection unsuccessful
     }
     if (v4_addr_count + v6_addr_count == 0) {
         std::cout << "no printable addresses for AF_INET/AF_INET6" << std::endl;
+    }
+    if (!connected) {
+        std::cerr << "Failed to connect to any resolved address (timed out or refused)" << std::endl;
+        return EXIT_FAILURE;
     }
     std::cout<< "Resolved " << total_addr_count << " addresses (" << v4_addr_count << " IPv4, " << v6_addr_count << " IPv6)" << std::endl;
 
