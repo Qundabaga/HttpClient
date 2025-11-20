@@ -126,14 +126,13 @@ int main(const int argc, char* argv[] ) {
     //Create ipbuffer with max possible size = ipv6
     char ipbuffer[INET6_ADDRSTRLEN];
     std::string ipv = "";
-    int sockfd, connfd, selectfd;
+    int sockfd, connfd, selectfd,so_error;
     bool connected = false;
-    int errno;
 
     fd_set writefds; // Used to perform select() in the socket
     struct timeval tv;
-    tv.tv_sec = 5;
-    tv.tv_usec = 5000;
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
 
     int optval;
     socklen_t optlen;
@@ -175,18 +174,20 @@ int main(const int argc, char* argv[] ) {
 
         if((connfd = connect(sockfd, rp->ai_addr, rp->ai_addrlen)) == 0) {
             connected = true;
-            std::cout << "Connected to straight"<< ipbuffer <<":80 " << ipv << std::endl;
+            std::cout << "Connected to "<< ipbuffer <<":80 " << ipv << std::endl;
             break;
         } else if(connfd == -1 && errno == EINPROGRESS) { // If unable to connect straight away, wait a bit to get result again
             FD_ZERO(&writefds);//initialize file descriptor set values to contain no file descriptors
             FD_SET(sockfd, &writefds); //set the current used socket to t
+            tv.tv_sec = 3; // set timeval each time before using select
             selectfd = select(sockfd+1,NULL,&writefds,NULL,&tv); //get the answer from socket in timespan selected in tv timeval struct
             if (selectfd > 0) { // If we have at least one answer from the socket then proceed
-                if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &optval, &optlen)== 0) { // if connection succeeded stop looking
+                so_error = getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &optval, &optlen);
+                if (so_error == 0 && optval == 0) { // if connection succeeded stop looking
                     connected = true;
                     std::cout << "Connected to "<< ipbuffer <<":80 " << ipv << std::endl;
                     FD_CLR(sockfd, &writefds); //remove socket from file descriptor set
-                    fcntl(sockfd, F_SETFL, ~O_NONBLOCK);
+                    fcntl(sockfd, F_SETFL, ~O_NONBLOCK); //put the socket back to blocking mode
                     break;
                 }
                 std::cout << "errno getsockopt: " << errno << std::endl;
@@ -203,6 +204,80 @@ int main(const int argc, char* argv[] ) {
         return EXIT_FAILURE;
     }
     std::cout<< "Resolved " << total_addr_count << " addresses (" << v4_addr_count << " IPv4, " << v6_addr_count << " IPv6)" << std::endl;
+
+    std::string request = std::string("GET / HTTP/1.1\r\nHost: ") + std::string(view) + std::string("\r\nConnection: close\r\n\r\n");
+
+    std::cout << request << std::endl;
+
+    //Set the sock opt to SO_NOSIGPIPE to handle macos errors
+    optval = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_NOSIGPIPE,&optval,sizeof(optval)) !=0) {
+        std::cerr << "setsockopt SO_NOSIGPIPE failed" << std::endl;
+    }
+
+    size_t total_bytes_sent = 0;
+    size_t remaining_bytes = request.size();
+    ssize_t bytes_sent = 0; //Signed to be able to capture error = -1
+    //Loop to send all bytes.
+
+    char *request_body = request.data();
+    while (total_bytes_sent < request.size()) {
+        if ((bytes_sent = send(sockfd, request_body, remaining_bytes, 0)) <= 0) { // output of sent is number of bytes sent
+            if (errno == EINTR) { //if error EINTR retry once
+                if ((bytes_sent = send(sockfd, request_body, remaining_bytes, 0)) < 0) {
+                    std::cerr << "send failed" << std::endl;
+                    return EXIT_FAILURE;
+                }
+            }
+        }
+        request_body += bytes_sent;
+        total_bytes_sent += bytes_sent;
+        remaining_bytes -= bytes_sent;
+    }
+
+    std::cout << "Total bytes sent: " << total_bytes_sent << std::endl;
+
+    std::string response = "";
+    char response_buffer[4096];
+    ssize_t bytes_received = 0;
+    size_t total_bytes_received = 0;
+    response.reserve(10224*12);//selected a size which works for most of the tested websites
+
+    do {
+        if ((bytes_received = recv(sockfd, &response_buffer, sizeof(response_buffer), 0)) < 0) {
+            if (errno == EINTR) { // on this error 1 additional try
+                if ((bytes_received = recv(sockfd, &response_buffer, sizeof(response_buffer), 0)) < 0) {
+                    std::cerr << "recv failed, errno: " << errno << std::endl;
+                    return EXIT_FAILURE;
+                }
+            }
+        }
+        response.append(response_buffer,bytes_received);
+        total_bytes_received += bytes_received;
+    } while (bytes_received !=  0);
+
+    close(sockfd); // close the socket when finished
+
+    //std::cout << response << std::endl;
+
+    std::cout << "total bytes recieved: " << total_bytes_received << std::endl;
+
+    size_t header_end = response.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
+        std::cerr << "Header terminator not found" << std::endl;
+        return EXIT_FAILURE;
+    }
+
+    std::string response_header = response.substr(0,header_end);
+    std::string status_line = response_header.substr(0,response_header.find("\r\n"));
+
+    response_header = response_header.substr(response_header.find("\r\n"));
+
+    //while
+
+    std::cout << "Status line: " << status_line << std::endl;
+    std::cout << "Response header:\n" << response_header<< std::endl;
+
 
     freeaddrinfo(result);
 
